@@ -17,10 +17,21 @@
 #define TOTAL_WAIT_TIME_IN_MS 200
 #define SAFE_FRONT_DISTANCE_IN_CM 25
 
+typedef enum {
+  CAR_STATE_STOPPED,
+  CAR_STATE_TURNING_LEFT,
+  CAR_STATE_TURNING_RIGHT,
+  CAR_STATE_MOVING_FORWARD,
+  CAR_STATE_TURNING_FORWARD_LEFT,
+  CAR_STATE_TURNING_FORWARD_RIGHT,
+  CAR_STATE_MOVING_BACKWARD,
+  CAR_STATE_TURNING_BACKWARD_LEFT,
+  CAR_STATE_TURNING_BACKWARD_RIGHT
+} CarStates;
+
 volatile car_Requests request = NO_REQUEST;
-car_Requests lastRequest = REQUEST_STOP;
 uint16_t turnTickCount;
-uint8_t isTurning = FALSE;
+CarStates _carState = CAR_STATE_STOPPED;
 
 void car_initialize() {
   hal_car_initialize();
@@ -37,42 +48,96 @@ uint8_t car_setSpeed(uint8_t percentage) {
   return percentage;
 }
 
-void _startTurning() {
+void _resetTurnTickCount() {
   turnTickCount = timer_getTickCount();
-  isTurning = TRUE;
 }
 
-uint8_t _isTurningComplete() {
+uint8_t _isTurnTickCountExpired() {
   return (timer_getTickCount() - turnTickCount) > TOTAL_WAIT_TIME_IN_MS;
 }
 
 inline void _stop() {
-  lastRequest = REQUEST_STOP;
-  hal_car_stop();
+  hal_car_stopLeftMotor();
+  hal_car_stopRightMotor();
+  _carState = CAR_STATE_STOPPED;
 }
 
 inline void _forward() {
-  lastRequest = REQUEST_FORWARD;
-  hal_car_moveForward();
+  hal_car_forwardLeftMotor();
+  hal_car_forwardRightMotor();
+  _carState = CAR_STATE_MOVING_FORWARD;
 }
 
 inline void _backward() {
-  lastRequest = REQUEST_BACKWARD;
-  hal_car_moveBackward();
+  hal_car_backwardLeftMotor();
+  hal_car_backwardRightMotor();
+  _carState = CAR_STATE_MOVING_BACKWARD;
 }
 
 inline void _left() {
-  hal_car_turnLeft();
-  _startTurning();
+  switch(_carState) {
+    case CAR_STATE_STOPPED:
+    case CAR_STATE_TURNING_LEFT:
+    case CAR_STATE_TURNING_RIGHT: {
+      hal_car_forwardRightMotor();
+      hal_car_backwardLeftMotor();
+      _carState = CAR_STATE_TURNING_LEFT;
+    }
+    break;
+    case CAR_STATE_MOVING_FORWARD:
+    case CAR_STATE_TURNING_FORWARD_LEFT:
+    case CAR_STATE_TURNING_FORWARD_RIGHT: {
+      hal_car_stopLeftMotor();
+      _carState = CAR_STATE_TURNING_FORWARD_LEFT;
+    }
+    break;
+    case CAR_STATE_MOVING_BACKWARD:
+    case CAR_STATE_TURNING_BACKWARD_LEFT:
+    case CAR_STATE_TURNING_BACKWARD_RIGHT: {
+      hal_car_stopLeftMotor();
+      _carState = CAR_STATE_TURNING_BACKWARD_LEFT;
+    }
+    break;
+  }
+
+  _resetTurnTickCount();
 }
 
 inline void _right() {
-  hal_car_turnRight();
-  _startTurning();
+  switch(_carState) {
+    case CAR_STATE_STOPPED:
+    case CAR_STATE_TURNING_LEFT:
+    case CAR_STATE_TURNING_RIGHT: {
+      hal_car_forwardLeftMotor();
+      hal_car_backwardRightMotor();
+      _carState = CAR_STATE_TURNING_RIGHT;
+    }
+    break;
+    case CAR_STATE_MOVING_FORWARD:
+    case CAR_STATE_TURNING_FORWARD_LEFT:
+    case CAR_STATE_TURNING_FORWARD_RIGHT: {
+      hal_car_stopRightMotor();
+      _carState = CAR_STATE_TURNING_FORWARD_RIGHT;
+    }
+    break;
+    case CAR_STATE_MOVING_BACKWARD:
+    case CAR_STATE_TURNING_BACKWARD_LEFT:
+    case CAR_STATE_TURNING_BACKWARD_RIGHT: {
+      hal_car_stopRightMotor();
+      _carState = CAR_STATE_TURNING_BACKWARD_RIGHT;
+    }
+    break;
+  }
+
+  _resetTurnTickCount();
 }
 
 
-void processRequest() {
+inline void _handleRequest() {
+  if(NO_REQUEST == request) {
+    return;
+  }
+  
   switch(request) {
     case REQUEST_STOP:     _stop();     break;
     case REQUEST_FORWARD:  _forward();  break;
@@ -91,28 +156,69 @@ void car_setRequest(car_Requests req) {
   request = req;
 }
 
-void car_run() {
-  // Always check for front clearance
+void _handleForwardObstacle() {
+  _stop();
+  uart_sendString("Obstacle! in ", 13);
+  uart_sendNumber(ultrasonic_getDistanceInCm());
+  uart_sendString(" cm.", 4);
+  uart_sendLineBreak();
+}
+
+uint8_t _isTurnInProgress() {
+  switch(_carState) {
+    case CAR_STATE_TURNING_LEFT:
+    case CAR_STATE_TURNING_RIGHT:
+    case CAR_STATE_TURNING_FORWARD_LEFT:
+    case CAR_STATE_TURNING_FORWARD_RIGHT:
+    case CAR_STATE_TURNING_BACKWARD_LEFT:
+    case CAR_STATE_TURNING_BACKWARD_RIGHT:
+      return TRUE;
+    default:
+      return FALSE;
+  }
+}
+
+inline void _handleTurnTimer() {
+  if(_isTurnInProgress() && _isTurnTickCountExpired()) {
+    switch(_carState) {
+      case CAR_STATE_TURNING_FORWARD_LEFT:
+      case CAR_STATE_TURNING_FORWARD_RIGHT: {
+        _forward();
+      }
+      break;
+      
+      case CAR_STATE_TURNING_BACKWARD_LEFT:
+      case CAR_STATE_TURNING_BACKWARD_RIGHT: {
+        _backward();
+      }
+      break;
+      
+      case CAR_STATE_TURNING_LEFT:
+      case CAR_STATE_TURNING_RIGHT:
+      default: {
+        _stop();
+      }
+      break;
+    }
+  }
+}
+
+inline void _checkObstacle() {
   if (SAFE_FRONT_DISTANCE_IN_CM > ultrasonic_getDistanceInCm()) {
-    if(REQUEST_FORWARD == lastRequest) {
-      _stop();
-      uart_sendString("Obstacle! in ", 13);
-      uart_sendNumber(ultrasonic_getDistanceInCm());
-      uart_sendString(" cm.", 4);
-      uart_sendLineBreak();
+    if(CAR_STATE_MOVING_FORWARD == _carState) {
+      _handleForwardObstacle();
     }
     
+    // With Obstacle ahead, if a pending request of forward movement is present
+    // then ignore that request
     if(REQUEST_FORWARD == request) {
-      request = REQUEST_STOP;
+      request = NO_REQUEST;
     }
   }
-  
-  if(request != NO_REQUEST) {
-    processRequest();
-  }
-  
-  if(isTurning && _isTurningComplete()) {
-    request = lastRequest;
-    isTurning = FALSE;
-  }
+}
+
+void car_run() {
+  _checkObstacle();  
+  _handleTurnTimer();  
+  _handleRequest();
 }
